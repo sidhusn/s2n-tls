@@ -163,23 +163,19 @@ int main(int argc, char **argv)
     /* Setup server config */
     struct s2n_config *server_config = s2n_config_new();
     EXPECT_NOT_NULL(server_config);
-    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(server_config, "default_tls13"));
+    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(server_config, "AWS-CRT-SDK-TLSv1.0"));
     EXPECT_SUCCESS(s2n_config_set_unsafe_for_testing(server_config));
     struct s2n_cert_chain_and_key *tls13_chain_and_key = NULL;
     EXPECT_SUCCESS(s2n_test_cert_chain_and_key_new(&tls13_chain_and_key, S2N_DEFAULT_ECDSA_TEST_CERT_CHAIN,
                                                    S2N_DEFAULT_ECDSA_TEST_PRIVATE_KEY));
     EXPECT_SUCCESS(s2n_config_add_cert_chain_and_key_to_store(server_config, tls13_chain_and_key));
-    struct s2n_cert_chain_and_key *tls12_chain_and_key = NULL;
-    EXPECT_SUCCESS(s2n_test_cert_chain_and_key_new(&tls12_chain_and_key, S2N_DEFAULT_TEST_CERT_CHAIN, 
-                                                   S2N_DEFAULT_TEST_PRIVATE_KEY));
-    EXPECT_SUCCESS(s2n_config_add_cert_chain_and_key_to_store(server_config, tls12_chain_and_key));
     EXPECT_SUCCESS(s2n_config_set_session_tickets_onoff(server_config, true));
     EXPECT_SUCCESS(s2n_setup_test_ticket_key(server_config));
 
     /* Setup TLS1.3 client config */
     struct s2n_config *tls13_client_config = s2n_config_new();
     EXPECT_NOT_NULL(tls13_client_config);
-    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(tls13_client_config, "default_tls13"));
+    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(tls13_client_config, "AWS-CRT-SDK-TLSv1.0"));
     EXPECT_SUCCESS(s2n_config_set_unsafe_for_testing(tls13_client_config));
     EXPECT_SUCCESS(s2n_config_set_session_tickets_onoff(tls13_client_config, true));
     DEFER_CLEANUP(struct s2n_stuffer cb_session_data = { 0 }, s2n_stuffer_free);
@@ -189,7 +185,7 @@ int main(int argc, char **argv)
     /* Setup TLS1.2 client config */
     struct s2n_config *tls12_client_config = s2n_config_new();
     EXPECT_NOT_NULL(tls12_client_config);
-    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(tls12_client_config, "20170210"));
+    EXPECT_SUCCESS(s2n_config_set_cipher_preferences(tls12_client_config, "ELBSecurityPolicy-2016-08"));
     EXPECT_SUCCESS(s2n_config_set_unsafe_for_testing(tls12_client_config));
     EXPECT_SUCCESS(s2n_config_set_session_tickets_onoff(tls12_client_config, true));
 
@@ -414,13 +410,12 @@ int main(int argc, char **argv)
 
         EXPECT_SUCCESS(s2n_connection_set_config(client_conn, tls13_client_config));
         EXPECT_SUCCESS(s2n_connection_set_config(server_conn, server_config));
+        client_conn->security_policy_override = &security_policy_test_tls13_retry;
 
         /* Create nonblocking pipes */
         struct s2n_test_io_pair io_pair = { 0 };
         EXPECT_SUCCESS(s2n_io_pair_init_non_blocking(&io_pair));
         EXPECT_SUCCESS(s2n_connections_set_io_pair(client_conn, server_conn, &io_pair));
-
-        EXPECT_SUCCESS(s2n_connection_set_keyshare_by_name_for_testing(client_conn, "none"));
 
         /* Negotiate handshake */
         EXPECT_SUCCESS(s2n_negotiate_test_server_and_client(server_conn, client_conn));
@@ -437,8 +432,7 @@ int main(int argc, char **argv)
         EXPECT_SUCCESS(s2n_connection_wipe(client_conn));
         EXPECT_SUCCESS(s2n_connection_wipe(server_conn));
         EXPECT_SUCCESS(s2n_connections_set_io_pair(client_conn, server_conn, &io_pair));
-
-        EXPECT_SUCCESS(s2n_connection_set_keyshare_by_name_for_testing(client_conn, "none"));
+        client_conn->security_policy_override = &security_policy_test_tls13_retry;
 
         /* Client sets up a resumption connection with the received session ticket data */
         size_t cb_session_data_len = s2n_stuffer_data_available(&cb_session_data);
@@ -664,12 +658,46 @@ int main(int argc, char **argv)
         EXPECT_SUCCESS(s2n_connection_free(client_conn));
     }
 
+    /* If the server has no ticket key, no session ticket is issued. */
+    {
+        struct s2n_connection *client_conn = s2n_connection_new(S2N_CLIENT);
+        EXPECT_NOT_NULL(client_conn);
+
+        struct s2n_connection *server_conn = s2n_connection_new(S2N_SERVER);
+        EXPECT_NOT_NULL(server_conn);
+
+        /* Setup config without session ticket key */
+        struct s2n_config *no_key_config = s2n_config_new();
+        EXPECT_NOT_NULL(no_key_config);
+        EXPECT_SUCCESS(s2n_config_set_cipher_preferences(no_key_config, "default_tls13"));
+        EXPECT_SUCCESS(s2n_config_set_unsafe_for_testing(no_key_config));
+        EXPECT_SUCCESS(s2n_config_add_cert_chain_and_key_to_store(no_key_config, tls13_chain_and_key));
+        EXPECT_SUCCESS(s2n_config_set_session_tickets_onoff(no_key_config, true));
+
+        EXPECT_SUCCESS(s2n_connection_set_config(server_conn, no_key_config));
+        EXPECT_SUCCESS(s2n_connection_set_config(client_conn, tls13_client_config));
+
+        /* Create nonblocking pipes */
+        struct s2n_test_io_pair io_pair = { 0 };
+        EXPECT_SUCCESS(s2n_io_pair_init_non_blocking(&io_pair));
+        EXPECT_SUCCESS(s2n_connections_set_io_pair(client_conn, server_conn, &io_pair));
+
+        EXPECT_SUCCESS(s2n_negotiate_test_server_and_client(server_conn, client_conn));
+
+        /* Server never sent a ticket to the client */
+        EXPECT_EQUAL(s2n_connection_get_session_length(client_conn), 0);
+
+        EXPECT_SUCCESS(s2n_io_pair_close(&io_pair));
+        EXPECT_SUCCESS(s2n_config_free(no_key_config));
+        EXPECT_SUCCESS(s2n_connection_free(server_conn));
+        EXPECT_SUCCESS(s2n_connection_free(client_conn));
+    }
+
     /* Clean-up */
     EXPECT_SUCCESS(s2n_config_free(server_config));
     EXPECT_SUCCESS(s2n_config_free(tls13_client_config));
     EXPECT_SUCCESS(s2n_config_free(tls12_client_config));
     EXPECT_SUCCESS(s2n_cert_chain_and_key_free(tls13_chain_and_key));
-    EXPECT_SUCCESS(s2n_cert_chain_and_key_free(tls12_chain_and_key));
 
     END_TEST();
 }
